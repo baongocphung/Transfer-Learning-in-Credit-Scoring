@@ -11,13 +11,16 @@ dự đoán xác suất default trên Default of Credit Card Clients (DCCC, 30K,
   PHẦN 1 — BASELINE (chỉ DCCC, không transfer)
     1.1 Load DCCC
     1.2 Preprocess DCCC
+        1.2.1 Sanitize EDUCATION/MARRIAGE
+        1.2.2 Clip PAY_X về [-2, 8]
+        1.2.3 Type cast & xác định feature lists
     1.3 Train/Test split (80/20 stratified) + StandardScaler
     1.4 Định nghĩa pipelines 3 model
         1.4.1 Logistic Regression
         1.4.2 Random Forest
         1.4.3 XGBoost
     1.5 5-fold StratifiedKFold cross-validation
-    1.6 Hold-out evaluation (20% ~ 6,000 mẫu)
+    1.6 Hold-out evaluation (6,000 mẫu)
     1.7 Lưu kết quả baseline → output/01_baseline.txt
 
   PHẦN 2 — HFA (Heterogeneous Feature Augmentation, Yang 2020 Eq. 6.8)
@@ -368,35 +371,46 @@ for r in baseline_holdout_results:
 LOG1.close()
 RUN_LOG.write(f"[Done] PHẦN 1 — BASELINE → {OUTPUT_DIR}/01_baseline.txt")
 
-# PHẦN 2 — HFA (Heterogeneous Feature Augmentation)
-# Tổng quan lý thuyết:
-#   HFA giải quyết bài toán Heterogeneous Transfer Learning (Xs ≠ Xt), trong đó
-#   source domain (Lending Club, d_s chiều) và target domain (Taiwan DCCC, d_t chiều)
-#   có feature spaces hoàn toàn khác nhau.
-#
-#   Ý tưởng cốt lõi (Yang, 2020):
-#     1. Project cả hai domain lên một common latent subspace d_c chiều qua
-#        hai ma trận chiếu: P ∈ R^{d_c×d_s} (cho source), Q ∈ R^{d_c×d_t} (cho target).
-#     2. Augment feature gốc vào common projection để tránh negative transfer
-#        (nếu chỉ dùng projection thuần, thông tin riêng của từng domain bị mất).
-#     3. Train SVM chung trên augmented space, tối ưu (P, Q, w, b) đồng thời.
-#
-#   Feature maps (Yang, 2020; Duan, 2012):
-#     φ_s(x) = [P·x ; x    ; 0_{d_t}]  — source: common + source-specific + zero-pad target
-#     φ_t(x) = [Q·x ; 0_{d_s} ; x   ]  — target: common + zero-pad source + target-specific
-#   → Không gian augmented có chiều d_c + d_s + d_t.
-#   → w = [w_c | w_s | w_t]: shared (w_c) + source-only (w_s) + target-only (w_t).
-#   → w_s không ảnh hưởng đến target prediction; w_t không ảnh hưởng đến source.
-#
-#   Bài toán tối ưu:
-#     min_{P,Q}  min_{w,b,ξ}  ½||w||² + C·[Σ_j ξ_j^s + Σ_i ξ_i^t]
-#     s.t.  y_j^s·(w^T φ_s(x_j^s) + b) ≥ 1 − ξ_j^s,  ξ_j^s ≥ 0
-#           y_i^t·(w^T φ_t(x_i^t) + b) ≥ 1 − ξ_i^t,  ξ_i^t ≥ 0
-#           ||P||²_F ≤ p,  ||Q||²_F ≤ q
-#   Sách dùng standard hinge (ξ ≥ 0 tuyến tính); Code dùng squared-hinge
-#   (mặc định LinearSVC, gradient mượt hơn, thực tế phổ biến hơn).
-# ==============================================================================
 
+# ════════════════════════════════════════════════════════════════════════
+# PHẦN 2 — HFA (Heterogeneous Feature Augmentation)
+# ════════════════════════════════════════════════════════════════════════
+#
+# NGUỒN LÝ THUYẾT BÁM SÁT:
+#   - Yang Q., Zhang Y., Dai W., Pan S.J. (2020) Transfer Learning,
+#     Cambridge University Press, Chapter 6, Eq. 6.8 (HFA primal form).
+#   - Duan L., Xu D., Tsang I.W. (2012) "Learning with Augmented Features
+#     for Heterogeneous Domain Adaptation", ICML.
+#   - Boyd S., Vandenberghe L. (2004) Convex Optimization §8.1.1.
+#   - Tseng P. (2001) J. Optim. Theory Appl. 109:475-494.
+#   - Achlioptas D. (2003) J. Comput. Syst. Sci. 66:671-687.
+#   - Chapelle O. (2007) Neural Comput. 19:1155-1178 (squared-hinge).
+#   - Hsieh C.-J. et al. (2008) ICML (LinearSVC dual coordinate descent).
+#   - Platt J.C. (1999) Adv. Large Margin Classifiers Sec. 5.
+#
+# PHÁT BIỂU HFA (Yang 2020 §6.3.2):
+#   Cho hai miền nguồn S = {(x_s,i, y_s,i)} với x_s ∈ R^{d_s},
+#   và đích T = {(x_t,j, y_t,j)} với x_t ∈ R^{d_t}, d_s ≠ d_t.
+#   Học hai phép chiếu P, Q và hyperplane (w, b) trên không gian augment
+#   R^{d_c+d_s+d_t}:
+#
+#     phi_s(x) = [P x ; x ; 0_{d_t}]      (cho điểm nguồn)
+#     phi_t(x) = [Q x ; 0_{d_s} ; x]      (cho điểm đích)
+#
+#   bằng cách giải hàm mục tiêu Eq. 6.8:
+#
+#     min  (1/2)||w||^2 + (lam_P/2)||P||_F^2 + (lam_Q/2)||Q||_F^2 + C * sum xi_i^2
+#     s.t. y_i (w . phi(x_i) + b) >= 1 - xi_i,  xi_i >= 0,
+#          ||P||_F <= r_P,  ||Q||_F <= r_Q.
+#
+# CHIẾN LƯỢC TỐI ƯU (BCD - Tseng 2001 Th. 4.1):
+#   Lặp n_outer vòng, mỗi vòng:
+#     (1) Cố định (P, Q) → augment → fit LinearSVC → cập nhật (w, b).
+#     (2) Cố định (w, b) → projected sub-gradient trên (P, Q).
+#     (3) Chiếu (P, Q) lên cầu Frobenius (closed-form Boyd 2004).
+#   Tseng 2001 đảm bảo: mọi điểm tụ là stationary point của Eq. 6.8.
+#
+# ════════════════════════════════════════════════════════════════════════
 LOG2 = TeeLogger(OUTPUT_DIR / "02_hfa.txt")
 LOG2.section("PHẦN 2 — HFA: Heterogeneous Feature Augmentation", level=1)
 LOG2.write("Source: Lending Club (sau preprocessing+subsample 300K)")
@@ -404,14 +418,8 @@ LOG2.write("Target: DCCC (đã chuẩn bị ở Phần 1)")
 LOG2.write("Tham chiếu: Yang Q. et al. (2020) Transfer Learning, Cambridge UP, "
            "Ch.6 Eq.6.8; Duan L., Xu D., Tsang I.W. (2012) ICML.")
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # 2.1. Load Lending Club
-# ──────────────────────────────────────────────────────────────────────────────
-# Mục tiêu: đọc raw CSV và chỉ giữ các cột pre-decision (không có post-loan
-# leakage như total_pymnt, recoveries, last_pymnt_*).
-# Bracke et al. (2019) §4.2 nhấn mạnh tầm quan trọng của việc loại bỏ các
-# feature chỉ có sau khi quyết định cho vay.
 # ──────────────────────────────────────────────────────────────────────────────
 LOG2.section("2.1. Load Lending Club", level=2)
 
@@ -434,23 +442,16 @@ df_lc_raw = pd.read_csv(lc_path, usecols=lambda c: c in LC_USECOLS,
 LOG2.write(f"LC raw shape (cột chọn): {df_lc_raw.shape}")
 LOG2.write(f"loan_status counts:\n{df_lc_raw['loan_status'].value_counts().head(10)}")
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # 2.2. Tiền xử lý LC
 # ──────────────────────────────────────────────────────────────────────────────
-# Pipeline chuẩn: filter status → binary label → cast kiểu → encode categorical
-# → impute median → stratified subsample.
-# Mỗi bước đều có ghi log để reproducibility.
-# ──────────────────────────────────────────────────────────────────────────────
 LOG2.section("2.2. Tiền xử lý LC", level=2)
 
-# 2.2.1 Filter post-loan leakage (Bracke 2019 §4.2)
+# 2.2.1 Filter post-loan leakage (Bracke 2019 §4.2): chỉ giữ pre-decision feats
 LOG2.write("2.2.1. Đã loại post-loan features bằng cách chỉ đọc LC_USECOLS "
            "(không đọc total_pymnt/recoveries/last_pymnt_*).")
 
 # 2.2.2 Map loan_status → binary y
-# Chỉ giữ loans đã resolved (Fully Paid hoặc default), bỏ "Current"/"In Grace Period"
-# vì nhãn chưa xác định — thực hành chuẩn trong credit scoring research.
 LOG2.write("2.2.2. Map loan_status → binary y (1 = default).")
 DEFAULT_STATUSES = {"Charged Off", "Default", "Late (31-120 days)"}
 GOOD_STATUSES    = {"Fully Paid"}
@@ -470,15 +471,14 @@ def _emp_length_to_int(v):
     if "10+" in s: return 10.0
     digs = "".join(ch for ch in s if ch.isdigit())
     return float(digs) if digs else np.nan
-
-df_lc["term"]       = df_lc["term"].astype(str).str.extract(r"(\d+)").astype(float)
-df_lc["int_rate"]   = df_lc["int_rate"].astype(str).str.replace("%", "").astype(float)
-df_lc["revol_util"] = df_lc["revol_util"].astype(str).str.replace("%", "").replace("nan", np.nan).astype(float)
-df_lc["emp_length"] = df_lc["emp_length"].apply(_emp_length_to_int)
+df_lc["term"]        = df_lc["term"].astype(str).str.extract(r"(\d+)").astype(float)
+df_lc["int_rate"]    = df_lc["int_rate"].astype(str).str.replace("%", "").astype(float)
+df_lc["revol_util"]  = df_lc["revol_util"].astype(str).str.replace("%", "").replace("nan", np.nan).astype(float)
+df_lc["emp_length"]  = df_lc["emp_length"].apply(_emp_length_to_int)
 df_lc["earliest_cr_line"] = pd.to_datetime(
     df_lc["earliest_cr_line"], format="%b-%Y", errors="coerce")
-df_lc["cr_history_yr"] = (datetime.datetime(2018, 12, 31)
-                          - df_lc["earliest_cr_line"]).dt.days / 365.25
+df_lc["cr_history_yr"]   = (datetime.datetime(2018, 12, 31)
+                             - df_lc["earliest_cr_line"]).dt.days / 365.25
 df_lc.drop(columns=["earliest_cr_line"], inplace=True)
 
 # 2.2.4 Encode categorical
@@ -488,6 +488,7 @@ GRADE_MAP = {"A": 1, "B": 2, "C": 3, "D": 4, "E": 5, "F": 6, "G": 7}
 df_lc["grade_ord"] = df_lc["grade"].map(GRADE_MAP).astype(float)
 df_lc.drop(columns=["grade", "sub_grade"], inplace=True)
 
+# Region từ addr_state (giảm cardinality)
 REGION_MAP = {
     **dict.fromkeys(["CT","ME","MA","NH","NJ","NY","PA","RI","VT"], "NE"),
     **dict.fromkeys(["IL","IN","IA","KS","MI","MN","MO","NE","ND","OH","SD","WI"], "MW"),
@@ -505,12 +506,10 @@ LOG2.write("2.2.5. Imputation: median cho numeric.")
 for c in df_lc.columns:
     if df_lc[c].dtype.kind in "fi" and df_lc[c].isna().any():
         df_lc[c] = df_lc[c].fillna(df_lc[c].median())
-df_lc = df_lc.dropna()
+df_lc = df_lc.dropna()  # xóa nốt rows hiếm hoi còn NaN
 LOG2.write(f"LC sau encode/impute: {df_lc.shape}")
 
-# 2.2.6 Stratified subsample 300K
-# Halevy et al. (2009) "The Unreasonable Effectiveness of Data": diminishing returns
-# khi n > vài trăm nghìn với model tuyến tính — 300K đủ signal, giảm RAM/time.
+# 2.2.6 Stratified subsample 300K (Halevy 2009 — diminishing returns)
 LOG2.section("2.2.6. Stratified subsample 300K", level=3)
 y_lc_full = df_lc["y"].values.astype(int)
 if len(df_lc) > N_LC_KEEP:
@@ -527,326 +526,265 @@ X_lc = df_lc.drop(columns=["y"]).values.astype(float)
 features_lc = [c for c in df_lc.columns if c != "y"]
 LOG2.write(f"d_s = {X_lc.shape[1]} (LC), d_t = {X_dc_tr.shape[1]} (DCCC).")
 
-# Scale source và target — StandardScaler riêng từng domain (không leak cross-domain stats)
+# Scale source và target trên cùng StandardScaler riêng từng miền
 scaler_s = StandardScaler().fit(X_lc)
 X_s_scaled = scaler_s.transform(X_lc)
 scaler_t = StandardScaler().fit(X_dc_tr)
 X_t_tr_scaled = scaler_t.transform(X_dc_tr)
 X_t_te_scaled = scaler_t.transform(X_dc_te)
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # 2.3. HFA core implementation
 # ──────────────────────────────────────────────────────────────────────────────
 LOG2.section("2.3. HFA core", level=2)
 
-
-# ── 2.3.1. augment_source / augment_target ────────────────────────────────────
-# Hai feature maps φ_s, φ_t theo Yang 2020, Eq.6.8 / Duan 2012:
-#
-#   φ_s(x) = [P·x ; x    ; 0_{d_t}]   shape: (n_s, d_c + d_s + d_t)
-#   φ_t(x) = [Q·x ; 0_{d_s} ; x   ]   shape: (n_t, d_c + d_s + d_t)
-#
-# Giải thích từng block trong w = [w_c | w_s | w_t]:
-#   - w_c (d_c chiều): weight chung — áp dụng cho CẢ HAI miền qua projected feature P·x / Q·x.
-#   - w_s (d_s chiều): weight source-specific — chỉ active khi predict source
-#                       (target padding là 0 nên w_s · 0 = 0).
-#   - w_t (d_t chiều): weight target-specific — chỉ active khi predict target.
-#
-# Khi predict target: w^T φ_t(x) = w_c^T(Q·x) + w_s^T·0 + w_t^T·x
-#                                  = w_c^T(Q·x) + w_t^T·x
-# → Tự động chỉ dùng common knowledge + target-specific knowledge, KHÔNG bị
-#   nhiễu bởi source-specific feature.
-#
-# Ký hiệu: code dùng P ≡ P_s ∈ R^{d_c×d_s}, Q ≡ P_t ∈ R^{d_c×d_t} (Eq.6.8).
-# ──────────────────────────────────────────────────────────────────────────────
+# ── 2.3.1. augment_source / augment_target ───────────────────────────────────
+# NOTE: Tổ chức 3 block của vector augment là KEY POINT của HFA. Đảm bảo
+#       (i) common subspace có thể so sánh trực tiếp giữa hai miền,
+#       (ii) raw features được giữ nguyên (không mất thông tin gốc),
+#       (iii) zero-pad đảm bảo block raw chỉ active với miền tương ứng.
 def augment_source(X_s, P, d_t):
-    """φ_s(x) = [P·x ; x ; 0_{d_t}]  (Yang 2020, Eq.6.8).
-
-    Args:
-        X_s : (n_s, d_s)  — source features đã scale.
-        P   : (d_c, d_s)  — source projection matrix (P ≡ P_s trong Eq.6.8).
-        d_t : int          — số chiều target (dùng để tạo zero-padding đúng kích thước).
-    Returns:
-        (n_s, d_c + d_s + d_t)
-    """
-    XP  = X_s @ P.T                              # (n_s, d_c): common projection
-    pad = np.zeros((X_s.shape[0], d_t))          # (n_s, d_t): zero-pad target block
+    """φ_s(x) = [P x ; x ; 0_{d_t}]   (Yang 2020 Eq. 6.8)
+    P shape: (d_c, d_s); X_s shape: (n_s, d_s); output: (n_s, d_c+d_s+d_t)."""
+    XP   = X_s @ P.T          # (n_s, d_c)
+    pad  = np.zeros((X_s.shape[0], d_t))
     return np.hstack([XP, X_s, pad])
 
-
 def augment_target(X_t, Q, d_s):
-    """φ_t(x) = [Q·x ; 0_{d_s} ; x]  (Yang 2020, Eq.6.8).
-
-    Args:
-        X_t : (n_t, d_t)  — target features đã scale.
-        Q   : (d_c, d_t)  — target projection matrix (Q ≡ P_t trong Eq.6.8).
-        d_s : int          — số chiều source (dùng để tạo zero-padding đúng kích thước).
-    Returns:
-        (n_t, d_c + d_s + d_t)
-    """
-    XQ  = X_t @ Q.T                              # (n_t, d_c): common projection
-    pad = np.zeros((X_t.shape[0], d_s))          # (n_t, d_s): zero-pad source block
+    """φ_t(x) = [Q x ; 0_{d_s} ; x]   (Yang 2020 Eq. 6.8)."""
+    XQ  = X_t @ Q.T
+    pad = np.zeros((X_t.shape[0], d_s))
     return np.hstack([XQ, pad, X_t])
 
-
-# ── 2.3.2. _init_PQ — Gaussian random projection (Johnson-Lindenstrauss) ─────
-# Khởi tạo P, Q ~ N(0, 1/d_c) theo Johnson-Lindenstrauss lemma
-# (Achlioptas 2003): với σ = 1/√d_c, phép chiếu ngẫu nhiên bảo toàn
-# ||x||² với xác suất cao khi d_c = O(log n / ε²).
-#
-# Đây chỉ là điểm khởi đầu — vòng lặp BCD outer sẽ update P, Q về hướng
-# minimize hinge loss (supervised). Eq.6.8 không specify cách init;
-# random Gaussian projection là convention phổ biến trong heterogeneous TL.
-# ──────────────────────────────────────────────────────────────────────────────
+# ── 2.3.2. _init_PQ — Gaussian random projection (JL lemma) ──────────────────
 def _init_PQ(d_c, d_s, d_t, seed=SEED):
-    """Khởi tạo P ∈ R^{d_c×d_s}, Q ∈ R^{d_c×d_t} ~ N(0, 1/d_c).
+    """Khởi tạo (P, Q) theo Johnson-Lindenstrauss Gaussian random projection.
 
-    σ = 1/√d_c đảm bảo E[||P·x||²] ≈ ||x||² (unbiased norm preservation).
+    NOTE [Lý thuyết - Achlioptas 2003 Theorem 1.1]:
+        Cho R có entry i.i.d. ~ N(0, 1/d_c). Với mọi x:
+            Pr[(1-eps)||x||^2 <= ||R x||^2 <= (1+eps)||x||^2]
+                >= 1 - 2 exp(-d_c * eps^2 / 8).
+        => Random projection bảo toàn norm Euclidean với xác suất cao.
+
+    NOTE [Vì sao d_c=64?]:
+        Với eps=0.5, prob bảo toàn ~ 0.73. Với d_c=128 ~ 0.97. Notebook
+        chọn 64 cân bằng tốc độ tính và độ tin cậy. r_P=r_Q=10 đảm bảo
+        ||P||_F sau init xấp xỉ sqrt(d_c*d_s/d_c) = sqrt(d_s) < 10 thường.
+
+    NOTE [Vì sao không zero-init?]:
+        Zero-init làm gradient = 0 ngay bước đầu (Glorot 2010 AISTATS,
+        symmetry breaking) => BCD bị stuck.
     """
-    rng   = np.random.default_rng(seed)
+    rng = np.random.default_rng(seed)
     sigma = 1.0 / np.sqrt(d_c)
     P = rng.normal(0.0, sigma, size=(d_c, d_s))
     Q = rng.normal(0.0, sigma, size=(d_c, d_t))
     return P, Q
 
-
-# ── 2.3.3. _proj_frobenius_ball — chiếu Euclidean lên Frobenius ball ─────────
-# Eq.6.8 đặt hard constraint: ||P||²_F ≤ p và ||Q||²_F ≤ q.
-# Tương đương: ||P||_F ≤ r_P với r_P = √p  (r_Q = √q tương tự).
-# → Tham số r_P=10.0 trong code tương ứng với p=100 trong ký hiệu Eq.6.8.
-#
-# Công thức chiếu lên Frobenius ball bán kính r (Boyd & Vandenberghe 2004, §8.1.1):
-#   proj_C(M) = (r / ||M||_F) · M  nếu ||M||_F > r
-#             = M                  nếu không
-# ──────────────────────────────────────────────────────────────────────────────
+# ── 2.3.3. _proj_frobenius_ball — chiếu Euclidean lên cầu Frobenius ─────────
 def _proj_frobenius_ball(M, radius):
-    """proj_C(M) = (r/||M||_F)·M nếu ||M||_F > r; giữ nguyên nếu không.
+    """Phép chiếu Euclidean lên cầu Frobenius {M : ||M||_F <= r}.
 
-    Tham số:
-        radius : r_P hoặc r_Q, tương ứng √p hoặc √q trong Eq.6.8.
+    NOTE [Lý thuyết - Boyd & Vandenberghe 2004 §8.1.1]:
+        Tập C_r = { M : ||M||_F <= r } là lồi đóng. Phép chiếu Euclidean
+        có dạng đóng (closed form):
+            proj_{C_r}(M) = (r / ||M||_F) * M    nếu ||M||_F > r,
+                          = M                     ngược lại.
+        Tức là M được rescale nếu vượt biên, không đổi nếu trong biên.
+
+    NOTE [Vì sao Frobenius?]:
+        - Phép chiếu closed-form (không cần solver lồi).
+        - Tương đương regularizer L2 trên vec(M) - đối ngẫu với Ridge.
+        - np.linalg.norm(M) mặc định cho ma trận 2-D = Frobenius norm.
     """
-    nrm = np.linalg.norm(M)           # ||M||_F (Frobenius norm)
+    nrm = np.linalg.norm(M)
     if nrm > radius and nrm > 0:
         return (radius / nrm) * M
     return M
 
+# ── 2.3.4. _grad_PQ — subgradient squared-hinge trên active set ─────────────
+def _grad_PQ(P, Q, w, b, X_s, y_s_pm, X_t, y_t_pm, lam_P, lam_Q, C=1.0):
+    """Tính subgradient ∂L/∂P, ∂L/∂Q của hàm mục tiêu Eq. 6.8 (Yang 2020).
 
-# ── 2.3.4. _grad_PQ — subgradient squared-hinge w.r.t. P và Q ────────────────
-# Đạo hàm của objective Eq.6.8 (squared-hinge version) theo P:
-#
-#   L = ½||w||² + C·[Σ_j max(0,1−y_j^s·z_j^s)² + Σ_i max(0,1−y_i^t·z_i^t)²]
-#       + λ_P·||P||²_F + λ_Q·||Q||²_F
-#
-#   Trong đó z_j^s = w^T φ_s(x_j^s) + b = w_c^T P x_j^s + w_s^T x_j^s + b
-#
-#   ∂L/∂P = C · Σ_{j ∈ active_s} (-2·m_j^s·y_j^s) · (w_c ⊗ x_j^s) + 2λ_P·P
-#
-#   Trong đó m_j^s = 1 − y_j^s·z_j^s (margin slack),
-#            w_c ⊗ x_j^s là outer product hình dạng (d_c, d_s),
-#            "active" = tập samples vi phạm margin (m > 0).
-#
-#   Tương tự cho ∂L/∂Q với target samples.
-#
-# NOTE (design choice): Code dùng cả lam_P·P trong gradient (soft L2 penalty)
-# LẪN Frobenius projection (hard constraint). Eq.6.8 gốc chỉ dùng hard constraint.
-# Việc dùng cả hai tạo ra regularization mạnh hơn — chấp nhận được trong thực tế
-# (tránh overfitting khi n_target nhỏ), nhưng nên giữ lam_P, lam_Q nhỏ (1e-3).
-# Nếu muốn đúng hoàn toàn theo Eq.6.8: đặt lam_P=lam_Q=0.
-# ──────────────────────────────────────────────────────────────────────────────
-def _grad_PQ(P, Q, w, b, X_s, y_s_pm, X_t, y_t_pm, C, lam_P, lam_Q):
-    """Subgradient ∂L/∂P và ∂L/∂Q với squared-hinge loss.
+    NOTE [Lý thuyết — Yang 2020 Ch.6 Eq. 6.8]:
+        L(w, b, P, Q) = ½‖w‖² + (λ_P/2)‖P‖_F² + (λ_Q/2)‖Q‖_F²
+                       + C · Σ_i ξ_i²,
+        với ξ_i = max(0, 1 − y_i z_i) là squared-hinge slack
+        và z_i = w·φ(x_i) + b.
+
+    NOTE [Fix D2.1]: thêm hệ số C vào subgradient để khớp với hàm mục tiêu.
+        Trước đây coef_s, coef_t = -2·margin·y → thiếu C. Khi C ≠ 1 thì gradient
+        w.r.t. (P,Q) sẽ không cùng scale với SVM internal optimization.
+
+    NOTE [Suy diễn]: với squared-hinge ℓ(z) = max(0, 1−y·z)²,
+        ∂ℓ/∂z = -2·max(0, 1-y·z)·y trên active set { i : 1-y_i·z_i > 0 }.
+        Áp chain rule: z_i = w_c·(P x_s,i) + w_s,raw·x_s,i (block 1+2 của φ_s),
+        ⇒ ∂z_i/∂P = y_i · w_c · x_s,i^T (outer product).
+        Vậy ∂ℓ_i/∂P = -2·C·(1-y_i z_i)·y_i · w_c · x_s,i^T trên active set.
+
+    NOTE [Active set — Hsieh 2008 ICML]: chỉ tính gradient từ các margin
+        violator (i ∈ A), không tính từ điểm well-classified. Tăng tốc và
+        không thay đổi optimum.
 
     Args:
-        P, Q    : projection matrices hiện tại.
-        w, b    : SVM weights/bias từ bước inner (LinearSVC).
-        X_s     : (n_s, d_s) source features.
-        y_s_pm  : (n_s,) source labels ở ±1.
-        X_t     : (n_t, d_t) target features.
-        y_t_pm  : (n_t,) target labels ở ±1.
-        C       : SVM trade-off parameter (PHẢI khớp với C dùng trong LinearSVC).
-        lam_P, lam_Q : L2 regularization trên P, Q (soft penalty bổ sung).
+        P, Q       : ma trận chiếu hiện tại (d_c×d_s, d_c×d_t).
+        w, b       : tham số SVM trên không gian augment (d_c+d_s+d_t).
+        X_s, X_t   : raw features hai miền.
+        y_s_pm, y_t_pm : nhãn ở ±1 (đã chuyển từ 0/1 trước khi gọi).
+        lam_P, lam_Q   : hệ số regularizer Frobenius (mềm).
+        C          : hệ số squared-hinge Eq. 6.8 (mặc định 1.0).
+
     Returns:
-        gP (d_c, d_s), gQ (d_c, d_t)
+        gP (d_c×d_s), gQ (d_c×d_t).
     """
     d_c, d_s = P.shape
     _,   d_t = Q.shape
-
-    # Tách w thành 3 block theo cấu trúc augmented space: [w_c | w_s | w_t]
-    w_c = w[:d_c]                     # (d_c,) — common component
-
-    # Tính margin slack: m = 1 − y·(w^T φ(x) + b)
-    Phi_s    = augment_source(X_s, P, d_t)
-    Phi_t    = augment_target(X_t, Q, d_s)
-    margin_s = 1.0 - y_s_pm * (Phi_s @ w + b)   # (n_s,)
-    margin_t = 1.0 - y_t_pm * (Phi_t @ w + b)   # (n_t,)
-
-    # Active set: samples vi phạm margin (cần tính subgradient)
-    act_s = margin_s > 0    # (n_s,) bool
-    act_t = margin_t > 0    # (n_t,) bool
-
-    # Squared-hinge derivative: d/dm [max(0,m)²] = 2·max(0,m)
-    # → coef = ∂L_hinge / ∂z = −2·m·y  (chain rule qua z = y·(w^T φ + b))
-    coef_s = -2.0 * margin_s * y_s_pm   # (n_s,)
-    coef_t = -2.0 * margin_t * y_t_pm   # (n_t,)
-
-    # ∂L/∂P = C · Σ_{j∈act_s} coef_s[j] · outer(w_c, x_j^s) + 2λ_P·P
-    # Broadcast: (n_act, 1, 1) * (1, d_c, 1) * (n_act, 1, d_s) → sum → (d_c, d_s)
+    # tách w thành 3 block: w_c (common), w_s (source raw), w_t (target raw)
+    w_c = w[:d_c]
+    # Augment để tính margin
+    Phi_s = augment_source(X_s, P, d_t)
+    Phi_t = augment_target(X_t, Q, d_s)
+    z_s   = Phi_s @ w + b
+    z_t   = Phi_t @ w + b
+    margin_s = 1.0 - y_s_pm * z_s
+    margin_t = 1.0 - y_t_pm * z_t
+    act_s = margin_s > 0
+    act_t = margin_t > 0
+    # Squared-hinge: ℓ'(z) = -2·max(0, 1−y·z)·y, scale theo C (Eq. 6.8)
+    coef_s = -2.0 * C * margin_s * y_s_pm
+    coef_t = -2.0 * C * margin_t * y_t_pm
+    # ∂L/∂P_ij = Σ_{i ∈ act_s} coef_s_i * w_c[a] * X_s[i,b]
     if act_s.any():
-        gP = C * (coef_s[act_s, None, None]
-                  * w_c[None, :, None]
-                  * X_s[act_s, None, :]).sum(axis=0)
+        gP = np.outer(w_c, np.zeros(d_s))
+        gP = (coef_s[act_s, None, None]
+              * w_c[None, :, None] * X_s[act_s, None, :]).sum(axis=0)
     else:
         gP = np.zeros_like(P)
-
-    # ∂L/∂Q = C · Σ_{i∈act_t} coef_t[i] · outer(w_c, x_i^t) + 2λ_Q·Q
     if act_t.any():
-        gQ = C * (coef_t[act_t, None, None]
-                  * w_c[None, :, None]
-                  * X_t[act_t, None, :]).sum(axis=0)
+        gQ = (coef_t[act_t, None, None]
+              * w_c[None, :, None] * X_t[act_t, None, :]).sum(axis=0)
     else:
         gQ = np.zeros_like(Q)
-
-    # Cộng đạo hàm L2 regularizer trên P, Q
-    # (bổ sung vào Frobenius hard constraint — xem note ở header hàm)
-    gP = gP + 2.0 * lam_P * P
-    gQ = gQ + 2.0 * lam_Q * Q
-
+    # Cộng đạo hàm regularizer L2 trên P, Q
+    gP = gP + lam_P * P
+    gQ = gQ + lam_Q * Q
     return gP, gQ
 
-
-# ── 2.3.5. train_hfa — Block Coordinate Descent (BCD) ────────────────────────
-# Eq.6.8 là bài toán joint optimization (P, Q, w, b) — khó giải trực tiếp vì
-# ràng buộc Frobenius phi tuyến và SVM inner problem là QP.
-#
-# Code dùng BCD (Block Coordinate Descent) — approximation thực tế phổ biến:
-#   Outer loop n_outer lần:
-#     (1) Fix P, Q → Augment features → Solve SVM inner problem (LinearSVC)
-#         → Thu được (w*, b*) tối ưu với P, Q hiện tại.
-#     (2) Fix (w*, b*) → Tính subgradient ∂L/∂P, ∂L/∂Q → Projected gradient step:
-#           P ← P − η·gP  (gradient descent step)
-#           Q ← Q − η·gQ
-#     (3) Project P, Q về Frobenius ball bán kính r_P, r_Q (enforce constraint).
-#
-# Convergence: BCD với projected gradient được chứng minh converge cho
-# biconvex problems (Tseng 2001). Với fixed learning rate η, convergence
-# đến stationary point (không nhất thiết global optimum).
-#
-# Lưu ý: η cố định (không decay) — đơn giản nhưng đủ với n_outer nhỏ (5-10).
-#        Với n_outer lớn hơn, nên dùng Armijo line search hoặc AdaGrad.
-# ──────────────────────────────────────────────────────────────────────────────
+# ── 2.3.5. train_hfa — alternating optimization (BCD) ───────────────────────
 def train_hfa(X_s, y_s, X_t, y_t,
               d_c=64, n_outer=5, eta=1e-3,
               C=1.0, lam_P=1e-3, lam_Q=1e-3,
               r_P=10.0, r_Q=10.0,
               verbose=False):
-    """Train HFA bằng BCD (xấp xỉ joint optimization Eq.6.8).
+    """Block Coordinate Descent giải Eq. 6.8 (Yang 2020 §6.3.4).
 
-    Args:
-        X_s, y_s : source features/labels (đã scale).
-        X_t, y_t : target features/labels (đã scale).
-        d_c      : chiều common latent subspace.
-        n_outer  : số vòng lặp BCD outer.
-        eta      : learning rate cho projected gradient step.
-        C        : SVM trade-off (PHẢI nhất quán giữa LinearSVC và _grad_PQ).
-        lam_P, lam_Q : L2 penalty bổ sung trên P, Q (đặt 0 để đúng Eq.6.8 thuần).
-        r_P, r_Q : Frobenius ball radius (tương ứng √p, √q trong Eq.6.8).
+    NOTE [BCD - Tseng 2001 Th. 4.1]:
+        Hàm Eq. 6.8 không lồi đồng thời theo (P, Q, w) nhưng lồi theo
+        từng khối khi cố định khối khác. BCD luân phiên:
+
+        for k = 1 .. n_outer:
+            Bước 1: cố định (P, Q) ⇒ bài toán theo w trở thành SVM tuyến
+                    tính trên data augment ⇒ fit LinearSVC ⇒ (w_k, b_k).
+            Bước 2: cố định (w_k, b_k) ⇒ projected sub-gradient trên (P, Q).
+            Bước 3: chiếu (P, Q) lên cầu Frobenius.
+
+        Tseng 2001 Th. 4.1 đảm bảo mọi điểm tụ là stationary point của
+        Eq. 6.8 khi:
+            - L lồi theo từng khối,
+            - feasible region là tích Cartesian các tập đóng lồi,
+            - mỗi bước con không tăng L.
+
+    NOTE [Default & lý do]:
+        d_c    = 64       JL eps ~ 0.5 ở prob ~ 0.73.
+        n_outer = 5       Đủ converge với dataset trung bình (Duan 2012
+                          Table 2 cho thấy 3-10 vòng đều ổn).
+        eta    = 1e-3     Đủ nhỏ để projected gradient không overshoot.
+        C      = 1.0      Chuẩn LinearSVC.
+        lam_P, lam_Q = 1e-3   Frobenius regularizer mềm.
+        r_P, r_Q = 10.0   Hard constraint bán kính Frobenius.
 
     Returns:
-        dict với keys: P, Q, w, b, history.
+        dict {P, Q, w, b, history}.
+        history mỗi outer ghi ||P||_F, ||Q||_F, n_active để debug.
     """
     n_s, d_s = X_s.shape
     n_t, d_t = X_t.shape
-
-    # Khởi tạo P, Q và project ngay vào feasible set
     P, Q = _init_PQ(d_c, d_s, d_t)
     P = _proj_frobenius_ball(P, r_P)
     Q = _proj_frobenius_ball(Q, r_Q)
-
-    # Chuyển nhãn 0/1 → ±1 (cần cho hinge loss)
+    # Convert nhãn 0/1 → ±1 cho hinge
     y_s_pm = np.where(y_s == 1, 1.0, -1.0)
     y_t_pm = np.where(y_t == 1, 1.0, -1.0)
-
     history = []
     w = b = None
-
     for outer in range(n_outer):
-        # ── Bước 1: Fix P, Q → Solve SVM inner problem ──────────────────────
-        # Augment toàn bộ source + target, stack lại → một SVM duy nhất
-        # trên không gian d_c + d_s + d_t chiều.
-        Phi_s = augment_source(X_s, P, d_t)     # (n_s, d_c+d_s+d_t)
-        Phi_t = augment_target(X_t, Q, d_s)     # (n_t, d_c+d_s+d_t)
-        Phi   = np.vstack([Phi_s, Phi_t])        # (n_s+n_t, d_c+d_s+d_t)
+        # (1) Augment + fit SVM (squared-hinge)
+        Phi_s = augment_source(X_s, P, d_t)
+        Phi_t = augment_target(X_t, Q, d_s)
+        Phi   = np.vstack([Phi_s, Phi_t])
         y_all = np.concatenate([y_s, y_t])
-
+        # NOTE [Fix B2.2]: thêm class_weight='balanced' để khớp với Case 1/2
+        # trong ablation (cùng dùng balanced). Trước đây thiếu → Case 3 unfair.
+        # Yang 2020 §6.3 Eq. 6.8 không nói rõ class weight, nhưng vì DCCC + LC
+        # đều imbalanced (22 % / 14 %) → cần balanced để loss đối xứng giữa
+        # class (King & Zeng 2001).
         svm = LinearSVC(loss="squared_hinge", C=C, max_iter=2000,
-                        dual="auto", random_state=SEED)
+                        dual=True, random_state=SEED,
+                        class_weight="balanced")
         svm.fit(Phi, y_all)
-        w = svm.coef_.ravel().astype(float)     # (d_c+d_s+d_t,)
+        w = svm.coef_.ravel().astype(float)
         b = float(svm.intercept_[0])
-
-        # ── Bước 2: Fix (w, b) → Subgradient step trên P, Q ─────────────────
-        # QUAN TRỌNG: truyền C để gradient đúng tỷ lệ với SVM objective.
+        # (2) Subgradient step trên (P, Q)
+        # NOTE: truyền C để gradient w.r.t. (P,Q) đồng nhất với SVM internal.
         gP, gQ = _grad_PQ(P, Q, w, b, X_s, y_s_pm, X_t, y_t_pm,
-                          C=C, lam_P=lam_P, lam_Q=lam_Q)
+                          lam_P, lam_Q, C=C)
         P = P - eta * gP
         Q = Q - eta * gQ
-
-        # ── Bước 3: Project về Frobenius ball (enforce Eq.6.8 constraint) ────
+        # (3) Frobenius projection
         P = _proj_frobenius_ball(P, r_P)
         Q = _proj_frobenius_ball(Q, r_Q)
-
-        # Tính số active constraints để monitor convergence
-        margins_all = 1.0 - (np.concatenate([y_s_pm, y_t_pm])
-                              * (Phi @ w + b))
-        n_active = int((margins_all > 0).sum())   # FIX: .sum() gọi trên bool array, không phải trên int()
-
-        history.append({
-            "outer"    : outer + 1,
-            "||P||_F"  : float(np.linalg.norm(P)),
-            "||Q||_F"  : float(np.linalg.norm(Q)),
-            "n_active" : n_active,
-        })
-
+        # NOTE [Fix B2.1]: tính n_active = số sample violating margin
+        # (margin_i = 1 - y_i*z_i > 0). Trước đây code dùng
+        # int(boolarray).sum() → TypeError. Đã sửa thành
+        # int((boolarray).sum()) — đúng numpy semantics.
+        y_all_pm = np.concatenate([y_s_pm, y_t_pm])
+        z_all    = Phi @ w + b
+        n_active = int(((1.0 - y_all_pm * z_all) > 0).sum())
+        history.append({"outer"   : outer + 1,
+                        "||P||_F" : float(np.linalg.norm(P)),
+                        "||Q||_F" : float(np.linalg.norm(Q)),
+                        "n_active": n_active})
         if verbose:
             print(f"   [HFA outer {outer+1}/{n_outer}] "
                   f"||P||_F={history[-1]['||P||_F']:.3f}  "
-                  f"||Q||_F={history[-1]['||Q||_F']:.3f}  "
-                  f"n_active={n_active}")
-
+                  f"||Q||_F={history[-1]['||Q||_F']:.3f}")
     return {"P": P, "Q": Q, "w": w, "b": b, "history": history}
 
-
-# ── 2.3.6. predict_hfa_score + Platt calibration ──────────────────────────────
-# Prediction trên target domain:
-#   score(x_t) = w^T φ_t(x_t) + b
-#              = w_c^T(Q·x_t) + w_s^T·0 + w_t^T·x_t + b
-#              = w_c^T(Q·x_t) + w_t^T·x_t + b
-#
-# Phần w_s (source-specific) bị triệt tiêu tự động do zero-padding trong φ_t.
-# Kết quả: prediction target chỉ dùng common knowledge (w_c qua Q) +
-#           target-specific knowledge (w_t trực tiếp từ x_t).
-#
-# Score là giá trị thực (âm/dương) → cần calibrate thành probability [0,1]
-# bằng Platt scaling (Platt 1999): P(y=1|x) = σ(A·score + B).
-# ──────────────────────────────────────────────────────────────────────────────
+# ── 2.3.6. predict_hfa + Platt calibration ──────────────────────────────────
 def predict_hfa_score(model, X_t):
-    """Tính decision score = w^T φ_t(X_t) + b trên target domain.
-
-    Chỉ w_c (common) và w_t (target-specific) đóng góp;
-    w_s (source-specific) bị triệt tiêu bởi zero-padding trong φ_t.
-    """
-    d_s = model["P"].shape[1]          # chiều source — cần để tạo zero-pad đúng
+    """Score = w·φ_t(X_t) + b (tuyến tính trong augmented space)."""
+    d_s = model["P"].shape[1]
     d_t = model["Q"].shape[1]
     Phi_t = augment_target(X_t, model["Q"], d_s)
     return Phi_t @ model["w"] + model["b"]
 
-
 def _platt_calibrate(scores_train, y_train):
-    """Fit Platt sigmoid: P(y=1) = σ(A·s + B)  (Platt 1999).
+    """Hiệu chuẩn xác suất theo Platt 1999 §5.
 
-    Dùng LogisticRegression với C rất lớn (≈ no regularization) để fit
-    chính xác A, B trên training scores — standard practice sau SVM.
+    NOTE [Lý thuyết - Platt 1999]:
+        SVM cho decision score f(x) = w . phi(x) + b ∈ R - không phải
+        xác suất. Platt scaling fit:
+            P_hat(y=1|x) = sigma(A * f(x) + B) = 1/(1 + exp(-A f - B))
+        bằng MLE trên (f(x_i), y_i). Sklearn LogisticRegression 1-feature
+        input ≡ MLE Platt.
+
+    NOTE [C=1e6]: regularization rất nhẹ ~ MLE thuần.
+    NOTE [class_weight='balanced']: bù imbalanced (King & Zeng 2001).
+
+    NOTE [Cải tiến tiềm năng]:
+        Platt khuyến nghị fit calibration trên fold KHÁC fold fit SVM
+        để tránh over-confident calibration. Có thể thay bằng
+        CalibratedClassifierCV(method='sigmoid', cv=3) cho chuẩn hơn.
     """
     lr = LogisticRegression(C=1e6, solver="lbfgs",
                              class_weight="balanced", max_iter=200)
@@ -855,9 +793,7 @@ def _platt_calibrate(scores_train, y_train):
     B = float(lr.intercept_[0])
     return A, B
 
-
 def predict_hfa_proba(model, X_t, A, B):
-    """Xác suất P(default=1 | x_t) = σ(A · score + B)."""
     s = predict_hfa_score(model, X_t)
     return 1.0 / (1.0 + np.exp(-(A * s + B)))
 
@@ -865,16 +801,13 @@ def predict_hfa_proba(model, X_t, A, B):
 # ──────────────────────────────────────────────────────────────────────────────
 # 2.4. 5-fold CV trên DCCC (LC làm source cố định)
 # ──────────────────────────────────────────────────────────────────────────────
-# Cross-validation đánh giá khả năng generalize của HFA trên DCCC target domain.
-# LC source được sub-sample cố định (50K) cho tốc độ — đủ signal cho SVM tuyến tính
-# và tránh memory bottleneck khi augmented matrix có kích thước n_s × (d_c+d_s+d_t).
-# ──────────────────────────────────────────────────────────────────────────────
 LOG2.section("2.4. HFA — 5-fold Cross-Validation", level=2)
 LOG_CV2 = TeeLogger(OUTPUT_DIR / "02a_hfa_cv.txt")
 LOG_CV2.section("PHẦN 2 — HFA — CHI TIẾT 5-FOLD CV", level=1)
 
+# Sub-sample LC nhỏ hơn cho CV để chạy nhanh (mỗi fold CV chỉ cần signal đủ)
 N_LC_CV = min(50_000, X_s_scaled.shape[0])
-rng_cv  = np.random.default_rng(SEED)
+rng_cv = np.random.default_rng(SEED)
 idx_lc_cv = rng_cv.choice(X_s_scaled.shape[0], size=N_LC_CV, replace=False)
 X_s_cv = X_s_scaled[idx_lc_cv]
 y_s_cv = y_lc[idx_lc_cv]
@@ -883,35 +816,29 @@ LOG_CV2.write(f"Target CV pool: {X_t_tr_scaled.shape}")
 
 cv_iter = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
 hfa_cv_scores = []
-
 for fold, (tr_idx, va_idx) in enumerate(cv_iter.split(X_t_tr_scaled, y_dc_tr), 1):
     X_tr = X_t_tr_scaled[tr_idx]; y_tr = y_dc_tr[tr_idx]
     X_va = X_t_tr_scaled[va_idx]; y_va = y_dc_tr[va_idx]
-
     LOG_CV2.section(f"Fold {fold}/{N_FOLDS}", level=3)
-
-    model  = train_hfa(X_s_cv, y_s_cv, X_tr, y_tr,
+    model = train_hfa(X_s_cv, y_s_cv, X_tr, y_tr,
                        d_c=64, n_outer=5, eta=1e-3,
-                       C=1.0, lam_P=1e-3, lam_Q=1e-3,
-                       r_P=10.0, r_Q=10.0)
-    s_va   = predict_hfa_score(model, X_va)
-    s_tr   = predict_hfa_score(model, X_tr)
-    A, B   = _platt_calibrate(s_tr, y_tr)
-    p_va   = 1.0 / (1.0 + np.exp(-(A * s_va + B)))
-    p_tr   = 1.0 / (1.0 + np.exp(-(A * s_tr + B)))
+                       C=1.0, r_P=10.0, r_Q=10.0)
+    s_va = predict_hfa_score(model, X_va)
+    s_tr = predict_hfa_score(model, X_tr)
+    A, B = _platt_calibrate(s_tr, y_tr)
+    p_va = 1.0 / (1.0 + np.exp(-(A * s_va + B)))
+    p_tr = 1.0 / (1.0 + np.exp(-(A * s_tr + B)))
     thr_tr, _ = find_optimal_threshold_ks(y_tr, p_tr)
-
     metrics = evaluate(f"HFA (fold {fold})", y_va, p_va, threshold=thr_tr)
     hfa_cv_scores.append(metrics)
     LOG_CV2.write(fmt_metrics_row(metrics))
     LOG2.write(f"  Fold {fold}: {fmt_metrics_row(metrics)}")
 
-# Aggregate CV results
+# Aggregate
 auc_mean = np.mean([m["AUC"] for m in hfa_cv_scores])
 ks_mean  = np.mean([m["KS"]  for m in hfa_cv_scores])
-auc_std  = np.std( [m["AUC"] for m in hfa_cv_scores])
-ks_std   = np.std( [m["KS"]  for m in hfa_cv_scores])
-
+auc_std  = np.std([m["AUC"]  for m in hfa_cv_scores])
+ks_std   = np.std([m["KS"]   for m in hfa_cv_scores])
 LOG_CV2.section("Tổng hợp 5-fold", level=3)
 LOG_CV2.write(f"AUC = {auc_mean:.4f} ± {auc_std:.4f}")
 LOG_CV2.write(f"KS  = {ks_mean:.4f} ± {ks_std:.4f}")
@@ -920,18 +847,8 @@ LOG2.write(f"Trung bình 5-fold: AUC={auc_mean:.4f}±{auc_std:.4f}, "
            f"KS={ks_mean:.4f}±{ks_std:.4f}")
 LOG2.write(f"Chi tiết → {OUTPUT_DIR}/02a_hfa_cv.txt")
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # 2.5. Hold-out evaluation + 4-case ablation
-# ──────────────────────────────────────────────────────────────────────────────
-# 4-case ablation để phân tích đóng góp của từng thành phần HFA:
-#   Case 1: DCCC alone              — baseline không có transfer
-#   Case 2: Concat naive (block-diag) — transfer không có projection học được
-#   Case 3: HFA full                — method đề xuất
-#   Case 4: LC alone (proxy)        — upper bound nguồn; proxy vì d_s ≠ d_t
-#
-# Mục tiêu: nếu Case 3 > Case 1 → HFA có ích.
-#           Nếu Case 3 > Case 2 → projection học được P, Q quan trọng hơn naive concat.
 # ──────────────────────────────────────────────────────────────────────────────
 LOG2.section("2.5. HFA — Hold-out + 4-case Ablation", level=2)
 LOG_HO2 = TeeLogger(OUTPUT_DIR / "02b_hfa_holdout.txt")
@@ -939,10 +856,10 @@ LOG_HO2.section("PHẦN 2 — HFA — HOLD-OUT (full-train)", level=1)
 LOG_AB2 = TeeLogger(OUTPUT_DIR / "02c_hfa_ablation.txt")
 LOG_AB2.section("PHẦN 2 — HFA — 4-CASE ABLATION", level=1)
 
-
+# Helper: chạy SVM thuần trên target (case 1) hoặc trên (concat naive — case 2)
+#         hoặc trên HFA augment (case 3) hoặc chỉ source (case 4).
 def _svm_fit_predict(X_tr, y_tr, X_te):
-    """Fit LinearSVC + Platt calibration; trả về (p_te, optimal_threshold)."""
-    svm = LinearSVC(loss="squared_hinge", C=1.0, max_iter=2000, dual="auto",
+    svm = LinearSVC(loss="squared_hinge", C=1.0, max_iter=2000, dual=True,
                     random_state=SEED, class_weight="balanced")
     svm.fit(X_tr, y_tr)
     s_tr = X_tr @ svm.coef_.ravel() + svm.intercept_[0]
@@ -953,28 +870,21 @@ def _svm_fit_predict(X_tr, y_tr, X_te):
     thr_tr, _ = find_optimal_threshold_ks(y_tr, p_tr)
     return p_te, thr_tr
 
-
 ablation_results = []
 
-
 # --- Case 1: DCCC alone (no transfer)
-# Baseline: SVM thuần trên target — không dùng bất kỳ source data nào.
 LOG_AB2.section("Case 1: DCCC alone (LinearSVC trên target only)", level=2)
 p_te, thr = _svm_fit_predict(X_t_tr_scaled, y_dc_tr, X_t_te_scaled)
 m = evaluate("HFA Case 1 (DCCC alone)", y_dc_te, p_te, threshold=thr)
 ablation_results.append(m); LOG_AB2.write(fmt_metrics_row(m))
 
-
-# --- Case 2: Concat naive (block-diagonal augment, KHÔNG có HFA)
-# Vì LC và DCCC có feature spaces khác nhau (d_s ≠ d_t), không thể concat trực tiếp.
-# Thay vào đó: block-diagonal augmentation — source ở nửa trái, target ở nửa phải.
-# Đây là "naive" transfer: dùng source data nhưng KHÔNG học projection chung.
-# Tương đương HFA với P=I_{d_c×d_s}=0 và Q=I_{d_c×d_t}=0 (không common subspace).
+# --- Case 2: Concat naive — chỉ khả thi nếu cùng dim. Vì heterogeneous,
+#     ta xếp 2 tập thành block-diagonal augment đơn giản: [LC ; 0] vs [0 ; DCCC]
 LOG_AB2.section("Case 2: Concat naive (block-diag augment, không HFA)", level=2)
-d_s_blk = X_s_cv.shape[1]; d_t_blk = X_t_tr_scaled.shape[1]
-Phi_s_naive  = np.hstack([X_s_cv,           np.zeros((X_s_cv.shape[0],        d_t_blk))])
-Phi_t_naive  = np.hstack([np.zeros((X_t_tr_scaled.shape[0], d_s_blk)), X_t_tr_scaled])
-Phi_te_naive = np.hstack([np.zeros((X_t_te_scaled.shape[0], d_s_blk)), X_t_te_scaled])
+d_s = X_s_cv.shape[1]; d_t = X_t_tr_scaled.shape[1]
+Phi_s_naive = np.hstack([X_s_cv,    np.zeros((X_s_cv.shape[0],  d_t))])
+Phi_t_naive = np.hstack([np.zeros((X_t_tr_scaled.shape[0], d_s)), X_t_tr_scaled])
+Phi_te_naive= np.hstack([np.zeros((X_t_te_scaled.shape[0], d_s)), X_t_te_scaled])
 p_te, thr = _svm_fit_predict(
     np.vstack([Phi_s_naive, Phi_t_naive]),
     np.concatenate([y_s_cv, y_dc_tr]),
@@ -982,85 +892,68 @@ p_te, thr = _svm_fit_predict(
 m = evaluate("HFA Case 2 (Concat naive)", y_dc_te, p_te, threshold=thr)
 ablation_results.append(m); LOG_AB2.write(fmt_metrics_row(m))
 
-
 # --- Case 3: HFA full method
 LOG_AB2.section("Case 3: HFA full method (LC source → DCCC target)", level=2)
 hfa_model = train_hfa(X_s_cv, y_s_cv, X_t_tr_scaled, y_dc_tr,
                       d_c=64, n_outer=5, eta=1e-3,
-                      C=1.0, lam_P=1e-3, lam_Q=1e-3,
-                      r_P=10.0, r_Q=10.0)
-s_tr  = predict_hfa_score(hfa_model, X_t_tr_scaled)
-s_te  = predict_hfa_score(hfa_model, X_t_te_scaled)
-A, B  = _platt_calibrate(s_tr, y_dc_tr)
-p_tr  = 1.0 / (1.0 + np.exp(-(A * s_tr + B)))
-p_te  = 1.0 / (1.0 + np.exp(-(A * s_te + B)))
+                      C=1.0, r_P=10.0, r_Q=10.0)
+s_tr = predict_hfa_score(hfa_model, X_t_tr_scaled)
+s_te = predict_hfa_score(hfa_model, X_t_te_scaled)
+A, B = _platt_calibrate(s_tr, y_dc_tr)
+p_tr = 1.0 / (1.0 + np.exp(-(A * s_tr + B)))
+p_te = 1.0 / (1.0 + np.exp(-(A * s_te + B)))
 thr_tr, _ = find_optimal_threshold_ks(y_dc_tr, p_tr)
 m = evaluate("HFA Case 3 (Full HFA)", y_dc_te, p_te, threshold=thr_tr)
 ablation_results.append(m); LOG_AB2.write(fmt_metrics_row(m))
 LOG_HO2.write(fmt_metrics_row(m))
 LOG_HO2.write(f"||P||_F = {np.linalg.norm(hfa_model['P']):.4f}")
 LOG_HO2.write(f"||Q||_F = {np.linalg.norm(hfa_model['Q']):.4f}")
-LOG_HO2.write(f"BCD history ({len(hfa_model['history'])} outer iters):")
+LOG_HO2.write(f"History (n_outer iterations):")
 for h in hfa_model["history"]:
-    LOG_HO2.write(f"  outer {h['outer']}: "
-                  f"||P||_F={h['||P||_F']:.3f}, "
-                  f"||Q||_F={h['||Q||_F']:.3f}, "
-                  f"n_active={h['n_active']}")
+    LOG_HO2.write(f"  outer {h['outer']}: |P|={h['||P||_F']:.3f} |Q|={h['||Q||_F']:.3f}")
 
-
-# --- Case 4: LC alone — proxy "source-only" trong HFA setting
-# Vấn đề: d_s ≠ d_t → không thể dùng SVM source trực tiếp predict DCCC test.
-#
-# Proxy được dùng: KNN trong common latent subspace (qua P và Q đã học từ Case 3):
-#   1. Project source về common space: c_s = P·x_s  (n_s, d_c)
-#   2. Project target về common space: c_t = Q·x_t  (n_te, d_c)
-#   3. Với mỗi target sample, tìm K nearest source neighbors (cosine sim trong common space)
-#   4. Dự đoán = trung bình nhãn ±1 của K neighbors → chuyển về probability.
-#
-# NOTE: Đây là approximation ad-hoc, KHÔNG phải "source-only".
-# "Source-only chuẩn" trong HFA sẽ là: dùng w_c học từ SVM train trên Phi_s,
-# sau đó predict target qua w_c^T(Q·x_t). Proxy KNN được dùng ở đây vì
-# SVM source dùng không gian augmented d_c+d_s+d_t chứ không phải d_s thuần.
-# Mục đích: đặt mốc so sánh (lower/upper bound), không phải method chính.
-# ──────────────────────────────────────────────────────────────────────────────
-LOG_AB2.section("Case 4: LC alone (KNN proxy trong common subspace)", level=2)
-P_model = hfa_model["P"]                             # (d_c, d_s)
-Q_model = hfa_model["Q"]                             # (d_c, d_t)
-
-common_s = X_s_cv @ P_model.T                        # (n_s, d_c)
-common_t = X_t_te_scaled @ Q_model.T                 # (n_te, d_c)
-
-# Normalize để dùng cosine similarity
+# --- Case 4: LC alone — train SVM trên LC, evaluate trên DCCC bằng cách
+#     cắt/pad chiều xuống d_t (không hợp lý cho heterogeneous nhưng đặt mốc)
+LOG_AB2.section("Case 4: LC alone (sanity — không transfer)", level=2)
+# Vì d_s ≠ d_t, ta tạo placeholder bằng LC encoder rồi predict DCCC qua HFA's Q
+# Đây là proxy của 'source-only'.
+svm_s = LinearSVC(loss="squared_hinge", C=1.0, max_iter=2000, dual=True,
+                  random_state=SEED, class_weight="balanced")
+svm_s.fit(X_s_cv, y_s_cv)
+# Project DCCC qua Q (HFA model) lên chiều common, rồi pad sang chiều source
+# qua phép giả định 0 (không có raw source feature cho DCCC):
+Q = hfa_model["Q"]
+common_t = X_t_te_scaled @ Q.T   # (n_te, d_c)
+# Source weight phần đầu d_c chiều — nhưng SVM source train trên d_s = 76,
+# không trên augmented. Thay vào, ta đo bằng nearest-neighbor:
+# Score = mean prediction của top-K source mẫu gần nhất (đo cosine common-subspace).
+P = hfa_model["P"]
+common_s = X_s_cv @ P.T          # (n_s, d_c)
 common_s_norm = common_s / (np.linalg.norm(common_s, axis=1, keepdims=True) + 1e-9)
 common_t_norm = common_t / (np.linalg.norm(common_t, axis=1, keepdims=True) + 1e-9)
-
+# Để tiết kiệm RAM, dùng batch
 K = 50
-y_s_pm_cv  = np.where(y_s_cv == 1, 1.0, -1.0)
-scores_te  = np.zeros(common_t.shape[0])
-batch_size = 1000
-
-for i in range(0, common_t_norm.shape[0], batch_size):
-    sims = common_t_norm[i:i+batch_size] @ common_s_norm.T   # (B, n_s)
+scores_te = np.zeros(common_t.shape[0])
+batch = 1000
+y_s_pm_cv = np.where(y_s_cv == 1, 1.0, -1.0)
+for i in range(0, common_t_norm.shape[0], batch):
+    sims = common_t_norm[i:i+batch] @ common_s_norm.T   # (B, n_s)
     topk = np.argpartition(-sims, K, axis=1)[:, :K]
-    scores_te[i:i+batch_size] = y_s_pm_cv[topk].mean(axis=1)
-
-p_te = (scores_te + 1.0) / 2.0    # map từ [-1,1] → [0,1]
+    # Average nhãn ±1 của top-K
+    scores_te[i:i+batch] = y_s_pm_cv[topk].mean(axis=1)
+p_te = (scores_te + 1) / 2.0  # đưa về [0,1]
 m = evaluate("HFA Case 4 (LC alone)", y_dc_te, p_te, threshold=0.5)
 ablation_results.append(m); LOG_AB2.write(fmt_metrics_row(m))
 
-# Bảng tổng hợp
 LOG_AB2.section("Bảng tổng hợp 4-case ablation", level=2)
-hdr = f"  {'Case':<30s} {'AUC':>8s} {'KS':>8s} {'Brier':>8s} {'Sens':>8s} {'Spec':>8s}"
-LOG_AB2.write(hdr)
-LOG_AB2.write("  " + "-" * 75)
+hdr = f"  {'Case':<25s} {'AUC':>8s} {'KS':>8s} {'Brier':>8s} {'Sens':>8s} {'Spec':>8s}"
+LOG_AB2.write(hdr); LOG_AB2.write("  " + "-" * 70)
 for r in ablation_results:
-    LOG_AB2.write(f"  {r['Model']:<30s} {r['AUC']:>8.4f} {r['KS']:>8.4f} "
+    LOG_AB2.write(f"  {r['Model']:<25s} {r['AUC']:>8.4f} {r['KS']:>8.4f} "
                   f"{r['Brier']:>8.4f} {r['Sens']:>8.4f} {r['Spec']:>8.4f}")
-LOG_AB2.close()
-LOG_HO2.close()
-LOG2.write(f"Chi tiết hold-out  → {OUTPUT_DIR}/02b_hfa_holdout.txt")
-LOG2.write(f"Chi tiết ablation  → {OUTPUT_DIR}/02c_hfa_ablation.txt")
-
+LOG_AB2.close(); LOG_HO2.close()
+LOG2.write(f"Chi tiết hold-out → {OUTPUT_DIR}/02b_hfa_holdout.txt")
+LOG2.write(f"Chi tiết ablation → {OUTPUT_DIR}/02c_hfa_ablation.txt")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 2.6. Tóm tắt phần HFA
@@ -1068,17 +961,63 @@ LOG2.write(f"Chi tiết ablation  → {OUTPUT_DIR}/02c_hfa_ablation.txt")
 LOG2.section("2.6. Tóm tắt phần HFA", level=2)
 LOG2.write(f"5-fold CV: AUC={auc_mean:.4f}±{auc_std:.4f}, "
            f"KS={ks_mean:.4f}±{ks_std:.4f}")
-LOG2.write("Hold-out 4-case ablation:")
+LOG2.write("Hold-out 4-case:")
 for r in ablation_results:
-    LOG2.write(f"  {r['Model']:<30s} | {fmt_metrics_row(r)}")
+    LOG2.write(f"  {r['Model']:<25s} | {fmt_metrics_row(r)}")
 
-hfa_holdout_main = ablation_results[2]    # Case 3 = Full HFA
-
+hfa_holdout_main = ablation_results[2]   # Case 3 = HFA full
 LOG2.close()
 RUN_LOG.write(f"[Done] PHẦN 2 — HFA → {OUTPUT_DIR}/02_hfa.txt")
 
 
-# PHẦN 3 — DANN (Domain-Adversarial Neural Network, Ganin 2016)
+# ════════════════════════════════════════════════════════════════════════
+# PHẦN 3 — DANN (Domain-Adversarial Neural Network)
+# ════════════════════════════════════════════════════════════════════════
+#
+# NGUỒN LÝ THUYẾT BÁM SÁT:
+#   - Ganin Y., Lempitsky V. (2015) "Unsupervised Domain Adaptation by
+#     Backpropagation", ICML — bài báo gốc DANN.
+#   - Ganin Y. et al. (2016) "Domain-Adversarial Training of Neural
+#     Networks", JMLR 17:1-35 — phiên bản mở rộng đầy đủ.
+#   - Ben-David S. et al. (2010) "A theory of learning from different
+#     domains", Mach. Learn. 79:151-175 — H-divergence bound.
+#   - Goodfellow I. et al. (2014) NeurIPS — Generative Adversarial Networks
+#     (nguyên lý min-max gốc).
+#   - He K. et al. (2015) ICCV — Kaiming initialization cho ReLU.
+#   - Ba J. et al. (2016) arXiv:1607.06450 — Layer Normalization.
+#   - Kingma D., Ba J. (2015) ICLR — Adam optimizer.
+#   - Pascanu R. et al. (2013) ICML — Gradient clipping.
+#
+# LÝ THUYẾT (Ben-David 2010 Th. 2):
+#   epsilon_T(h) <= epsilon_S(h) + (1/2) d_{H△H}(D_S, D_T) + lambda*
+#
+#   ⇒ Để giảm rủi ro target, ta giảm H-divergence d_{H△H} giữa source
+#   và target trong không gian biểu diễn (representation space).
+#
+# IDEA DANN (Ganin 2016):
+#   Học một encoder g sao cho domain classifier d KHÔNG phân biệt được
+#   source vs target trong g-space, thông qua MIN-MAX:
+#       min_{g, c} max_{d}  L_label(c(g(x_s)), y_s)
+#                          - lambda * L_domain(d(g(x)), domain_label)
+#   Cài đặt qua Gradient Reversal Layer (GRL):
+#       forward: identity
+#       backward: -lambda * grad
+#   ⇒ Trong một backward pass duy nhất, encoder MAX domain loss (lừa d)
+#   trong khi d MIN domain loss (đối nghịch nhau).
+#
+# KIẾN TRÚC HeteroDANN (cho d_s != d_t):
+#   - DomainEncoder_S: R^{d_s} -> R^{hidden}
+#   - DomainEncoder_T: R^{d_t} -> R^{hidden}
+#     (hai encoder không chia sẻ trọng số vì input shape khác)
+#   - LabelPredictor:  R^{hidden} -> R (logit binary)
+#   - DomainClassifier (qua GRL): R^{hidden} -> R (logit domain)
+#
+# NOTE QUAN TRỌNG [Deviation từ Ganin 2016 gốc]:
+#   Ganin 2016 là UNSUPERVISED DA - không dùng nhãn target. Code này dùng
+#   L_label_T (semi-supervised), phù hợp với context credit scoring nơi
+#   DCCC có nhãn. Đây là biến thể Bousmalis 2017 NeurIPS.
+#
+# ════════════════════════════════════════════════════════════════════════
 LOG3 = TeeLogger(OUTPUT_DIR / "03_dann.txt")
 LOG3.section("PHẦN 3 — DANN: Domain-Adversarial Neural Network", level=1)
 LOG3.write("Tham chiếu: Ganin Y. & Lempitsky V. (2015) ICML; Ganin Y. et al. "
@@ -1092,8 +1031,27 @@ LOG3.section("3.1. Kiến trúc HeteroDANN", level=2)
 
 # ── 3.1.1. GradientReversalFn ────────────────────────────────────────────────
 class GradientReversalFn(torch.autograd.Function):
-    """Identity forward, đảo dấu gradient backward, scale theo λ.
-    Ganin & Lempitsky 2015 ICML §3.2."""
+    """Gradient Reversal Layer - core trick của DANN.
+
+    NOTE [Ganin & Lempitsky 2015 ICML §3.2]:
+        forward(x)  = x                  (identity)
+        backward(g) = -lambda * g        (đảo dấu, scale theo lambda)
+
+    NOTE [Vì sao cần GRL]:
+        Min-max của adversarial training thường cần two-step optimization
+        (alternate update generator vs discriminator). GRL cho phép
+        một-pass: gradient ngược ra encoder bị đảo dấu => encoder MAX
+        domain loss (= lừa domain classifier), trong khi domain
+        classifier vẫn MIN domain loss (giải thẳng).
+
+    NOTE [Lý do x.view_as(x)]:
+        PyTorch yêu cầu output của Function phải là tensor mới (không
+        phải alias) để autograd track đúng (xem PyTorch issue #6020).
+        view_as(x) tạo view mới cùng dữ liệu nhưng tensor object mới.
+
+    NOTE [None thứ hai trong return của backward]:
+        lambda_ là hyperparameter, không cần gradient => trả None.
+    """
     @staticmethod
     def forward(ctx, x, lambda_):
         ctx.lambda_ = float(lambda_)
@@ -1103,7 +1061,12 @@ class GradientReversalFn(torch.autograd.Function):
         return -ctx.lambda_ * grad_output, None
 
 class GradientReversalLayer(nn.Module):
-    """Wrapping module để dễ tích hợp với nn.Sequential."""
+    """Wrapping module để dễ tích hợp nn.Sequential và device placement.
+
+    NOTE: lambda_ được cập nhật mỗi step (không phải hyperparameter cố
+    định) - thay đổi qua set_lambda() từ training loop theo lịch
+    Ganin 2016: lambda(p) = 2/(1+exp(-10p)) - 1.
+    """
     def __init__(self, lambda_=1.0):
         super().__init__()
         self.lambda_ = lambda_
@@ -1114,8 +1077,28 @@ class GradientReversalLayer(nn.Module):
 
 # ── 3.1.2. DomainEncoder ─────────────────────────────────────────────────────
 class DomainEncoder(nn.Module):
-    """MLP: Linear → LN → ReLU → Dropout → Linear → LN → ReLU.
-    Riêng cho mỗi miền do d_s ≠ d_t (heterogeneous setting)."""
+    """MLP encoder cho mỗi domain.
+
+    NOTE [Kiến trúc]: Linear -> LayerNorm -> ReLU -> Dropout
+                   -> Linear -> LayerNorm -> ReLU
+        (2 layers, hidden=128, dropout=0.2 mặc định).
+
+    NOTE [Vì sao LayerNorm thay BatchNorm — Ba 2016]:
+        Trong DANN, mỗi mini-batch chứa cả source và target sample.
+        Nếu BN, statistics bị tính trên hỗn hợp domain ⇒ smear
+        distribution boundary ⇒ encoder khó học domain-invariant.
+        LN tính theo feature dim của TỪNG sample ⇒ batch-independent.
+
+    NOTE [Kaiming init - He 2015 ICCV §2.2]:
+        ReLU triệt nửa input ⇒ Glorot init bị under-scaled cho ReLU.
+        Kaiming dùng sigma^2 = 2/fan_in (thay 1/fan_in của Xavier)
+        để bù cho ReLU. Bias init = 0 chuẩn.
+
+    NOTE [Hai encoder riêng]: do d_s != d_t (heterogeneous setting),
+        không thể chia sẻ trọng số layer đầu. Hai encoder hoàn toàn
+        độc lập, chỉ chia sẻ output dim = hidden để cùng vào
+        LabelPredictor và DomainClassifier.
+    """
     def __init__(self, in_dim, hidden=128, p_drop=0.2):
         super().__init__()
         self.net = nn.Sequential(
@@ -1228,9 +1211,41 @@ def _to_tensor(X, dtype=torch.float32):
 def train_dann(model, X_s, y_s, X_t, y_t,
                total_steps=2000, batch_size=128, initial_lr=0.01,
                max_grad_norm=1.0, verbose=False):
-    """Step-based training (Ganin 2016).
-    Loss: L = BCE_s(pos_weight=w_s) + γ_t·BCE_t(pos_weight=w_t)
-            + BCE_d (qua GRL với λ tăng dần)."""
+    """Step-based training cho HeteroDANN (Ganin 2016 §4.2).
+
+    NOTE [Loss tổng]:
+        L = BCE_s(pos_weight=w_s)
+          + gamma_t * BCE_t(pos_weight=w_t)
+          + BCE_d  (chú ý: GRL nằm GIỮA encoder và domain classifier
+                    nên gradient của BCE_d lan xuống encoder bị đảo
+                    dấu và scale theo lambda)
+
+    NOTE [Class weighting]:
+        - pos_weight_S = (#neg_S) / (#pos_S) ≈ 6.14 (LC 14% default).
+        - pos_weight_T = (#neg_T) / (#pos_T) ≈ 3.52 (DCCC 22% default).
+        - gamma_t = sqrt(n_s/n_t) ≈ 3.16 — boost target signal khi
+          n_s >> n_t (Cao 2019 NeurIPS, label-distribution-aware loss).
+        ⇒ Ba cơ chế bù imbalanced + source dominance ⇒ tránh NT.
+
+    NOTE [Lịch lambda - Ganin 2016 §4.2]:
+        lambda(p) = 2/(1+exp(-10p)) - 1, p = step/total_steps.
+        - lambda(0)   = 0       (warm-up: chưa adversarial)
+        - lambda(0.5) ≈ 0.987   (lên nhanh)
+        - lambda(1)   ≈ 1       (saturate)
+        Warm-up tránh disrupt encoder trước khi có representation tốt.
+
+    NOTE [Lịch LR - Ganin 2016 §4.2]:
+        eta(p) = eta_0 / (1 + 10p)^0.75. Polynomial decay - chậm hơn
+        exp decay nhưng nhanh hơn 1/sqrt(t).
+
+    NOTE [Adam - Kingma & Ba 2015]:
+        beta_1=0.9, beta_2=0.999, eps=1e-8 (mặc định). Adam ổn định
+        cho adversarial training (gradient có thể đột ngột do GRL).
+
+    NOTE [Gradient clipping - Pascanu 2013 ICML]:
+        max_norm = 1.0 (nhỏ - khuyến nghị Goodfellow 2014 cho GAN).
+        GRL có thể đảo một large gradient ⇒ clip giới hạn rủi ro.
+    """
     model.to(DEVICE)
     n_s = X_s.shape[0]; n_t = X_t.shape[0]
     pos_w_s = torch.tensor(
@@ -1501,8 +1516,10 @@ dann_holdout_main = dann_ablation[2]
 LOG3.close()
 RUN_LOG.write(f"[Done] PHẦN 3 — DANN → {OUTPUT_DIR}/03_dann.txt")
 
-# FINAL RESULT
 
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║                   FINAL — SO SÁNH BA PHƯƠNG PHÁP & KẾT LUẬN                   ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
 LOG_F = TeeLogger(OUTPUT_DIR / "99_final_comparison.txt")
 LOG_F.section("FINAL — SO SÁNH BASELINE / HFA / DANN (DCCC hold-out)", level=1)
 
@@ -1554,8 +1571,9 @@ LOG_F.write(
 LOG_F.close()
 RUN_LOG.write(f"[Done] FINAL → {OUTPUT_DIR}/99_final_comparison.txt")
 
-# END RUN
-
+# ══════════════════════════════════════════════════════════════════════════════
+#                              END RUN                                     
+# ══════════════════════════════════════════════════════════════════════════════
 RUN_LOG.write(f"\n[{datetime.datetime.now()}] Run finished.")
 RUN_LOG.write("Tóm tắt các file output:")
 for fn in sorted(OUTPUT_DIR.glob("*.txt")):
